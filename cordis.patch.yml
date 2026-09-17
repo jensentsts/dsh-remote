@@ -1,0 +1,51 @@
+# dsh-remote — patch 模板
+#
+# 把对应的那段追加到目标 profile 的 cordis.patch.yml 末尾即可。
+# 路径按你实际复制的目录改（注意 file:/// 三条斜杠 + 正斜杠）。
+# 两端各只装自己那一行，不要两行都装在同一台机器上
+# （除非你就是想做单机回环自测，那用不同端口避开即可）。
+
+# ─────────────────────────────────────────────────────────────
+# 【被控机】装这一段
+# ─────────────────────────────────────────────────────────────
+- insert:
+    - id: dsh-remote-server
+      name: 'file:///C:/Users/<you>/dsh-remote/src/server.ts'
+      config:
+        host: '127.0.0.1'
+        # 必须等于 frp 隧道里填的“本地端口”，且由本插件独占
+        port: 11325
+        # 密钥默认落在 ${DSH_HOME}/dsh-remote/{server.key, client.pub}
+        # 也可以在这里内联指定（privateKey 是 secret 字段，不会回显到 GUI 传输里）：
+        #   privateKey: '<PEM / 64位hex / base64>'
+        #   peerPublicKey: '<对端公钥 PEM>'
+        # 远端被创建会话的工作目录与默认 preset：
+        #   workspace: 'E:\path\app'
+        #   defaultPreset: 'cordis'
+
+# ─────────────────────────────────────────────────────────────
+# 【主控机】装这一段
+# ─────────────────────────────────────────────────────────────
+- insert:
+    - id: dsh-remote-client
+      name: 'file:///C:/Users/<you>/dsh-remote/src/client.ts'
+      config:
+        host: 'tunnel.example.com'
+        port: 10000
+        # 密钥默认落在 ${DSH_HOME}/dsh-remote/{client.key, server.pub}
+        #   privateKey: '<PEM / 64位hex / base64>'
+        #   peerPublicKey: '<对端公钥 PEM>'
+        # 不指定 session_id 时自动生成的会话前缀：
+        #   sessionPrefix: 'remote'
+
+# ─────────────────────────────────────────────────────────────
+# 单机回环自测（两端在同一台机器上，纯为验证链路）
+# 选一个空闲端口；默认的 11325 留给正式部署。
+# ─────────────────────────────────────────────────────────────
+# - insert:
+#     - id: dsh-remote-server
+#       name: 'file:///C:/path/to/dsh-remote/src/server.ts'
+#       config: { host: '127.0.0.1', port: 11326 }
+#     - id: dsh-remote-client
+#       name: 'file:///C:/path/to/dsh-remote/src/client.ts'
+#       config: { host: '127.0.0.1', port: 11326 }

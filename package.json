@@ -1,0 +1,37 @@
+{
+  "name": "dsh-remote",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pair of DeepSeek Harness plugins that turn one DSH instance into an agent-controllable peer of another, over a single authenticated TCP link (e.g. a frp tunnel).",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "remote",
+    "x25519",
+    "aes-256-gcm",
+    "frp"
+  ],
+  "homepage": "https://github.com/jensentsts/dsh-remote#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jensentsts/dsh-remote.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jensentsts/dsh-remote/issues"
+  },
+  "type": "module",
+  "exports": {
+    ".": "./src/server.ts",
+    "./server": "./src/server.ts",
+    "./client": "./src/client.ts",
+    "./protocol": "./src/protocol.ts",
+    "./keys": "./src/keys.ts"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml"
+  ],
+  "license": "MIT"
+}

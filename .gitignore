@@ -1,0 +1,31 @@
+# Key material never belongs in git. Generate locally with `python tools/gen-keys.py`;
+# the four files it writes are settings, not source. (See docs/SECURITY.md.)
+keys/
+*.key
+*.pub
+*.pem
+*.p12
+*.pfx
+
+# Generated / local state
+node_modules/
+dist/
+build/
+*.log
+*.tmp
+.deploy/
+
+# Editors & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
+*.swp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
