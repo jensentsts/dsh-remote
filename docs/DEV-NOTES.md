@@ -237,6 +237,23 @@ ctx.get('sessionTitle')?.rename(handle.agent.session, 'remote: …')   // 可选
 | **frp 隧道归属冲突** | 隧道"通"，但连到的是**本机**自己的服务 | 隧道 ID 是**独占槽位**，两台机器配置同源就变成"谁先连上谁占用" |
 | **DNS 污染** | `frpc 登录节点失败 … EOF`，而 TCP 连通性测试却正常 | 远端把**隧道节点的域名**解析成了 `.com` 顶级域根服务器地址。用 hosts 锁死真实 IP 解决 |
 
+### 3.10 命令输出被按错误编码解码（中文变 U+FFFD）
+
+- **症状**：`remote_exec` 跑 `whoami` / `ipconfig`，中文全变成 `����`；
+  但 `remote_ping` 返回的 `hostname`（读的是 `$env:COMPUTERNAME`）却是好的。
+- **根因**：Windows 上**两种编码混在同一个管道里**——PowerShell 自己的 cmdlet 输出是 .NET 字符串
+  （按控制台编码写出），而 `whoami.exe` / `ipconfig.exe` 这类**原生程序**按 ANSI/OEM 代码页
+  直接写字节。原实现把子进程输出**无条件按 UTF-8 解码**，原生那一半就烂了。
+  另一种"想当然的修法"（在 PowerShell 里强制 `[Console]::OutputEncoding=UTF8`）**更糟**：
+  它让 PowerShell 把原生程序的 GBK 字节当 UTF-8 解，信息在插件看到之前就已经丢了。
+- **处理**：用 `encoding: 'buffer'` 收**原始字节**，然后
+  **utf-8 严格 → gbk → big5 → shift_jis → windows-1252 → 有损回退** 依次尝试。
+  cmdlet 输出是合法 UTF-8，命中第一档；原生输出命中 GBK 档。
+- **教训**：`hostname.exe` 是**另一个**坑——它是 ANSI 程序，系统非 Unicode 代码页表示不出中文机名，
+  所以远端 `hostname` 永远输出垃圾，换个算法也救不回来。**要机名就读 `$env:COMPUTERNAME`**。
+- **验证**：远端 `remote_exec` 一次跑 cmdlet 中文 / `whoami` / `ipconfig` / `cmd` 四路中文，
+  全部正确（远端 `build: r8`）。
+
 ---
 
 ## 4. 版本历史
@@ -248,6 +265,7 @@ ctx.get('sessionTitle')?.rename(handle.agent.session, 'remote: …')   // 可选
 | r4 | `BUILD` 标记、`workspace`/`preset_id` 改为每次调用可传、`ctx.effect` 容错 | 3.3 / 3.4 / 3.8 |
 | r6 | `workspaceRegistry.create` + `attachSession` + 标题 | 3.2 |
 | r7 | 指纹改回 `sha256`（与密钥生成器一致） | 3.7 |
+| r8 | `exec` 按原始字节 + 多编码回退解码（修中文乱码） | 3.10 |
 
 > **热重载会留下僵死 socket**：每次换 `?v=` 都会新建一个监听，旧的不会自己关。
 > 自测时换一个干净端口，或用 `Get-NetTCPConnection -State Listen -LocalPort <port>`

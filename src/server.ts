@@ -67,7 +67,7 @@ export const SERVER_VERSION = '0.1.0'
  * file the runtime may still be serving the previous build. Shipping the tag
  * in `sysinfo` turns "did my edit take effect?" into one tool call.
  */
-export const BUILD = 'r7'
+export const BUILD = 'r8'
 
 /**
  * Hard dependencies. `agentDefaultModel` matters as much as the registries: a
@@ -412,6 +412,35 @@ export function apply(ctx: Context, config: Config = {}): void {
     }
   }
 
+  /**
+   * Decode a child process's output without guessing wrong.
+   *
+   * Windows mixes encodings: PowerShell's own cmdlets emit .NET strings in the
+   * console encoding, while native tools (`whoami.exe`, `ipconfig.exe`, …) write
+   * bytes in the ANSI/OEM code page. Decoding both as UTF-8 turns the native half
+   * into U+FFFD. So: strict UTF-8 first, then the Chinese ANSI code page, then a
+   * lossy fallback. (The raw bytes are still available to the caller if needed.)
+   *
+   * @param buf - raw bytes from the child.
+   * @returns the best-effort text.
+   */
+  const decodeOutput = (buf: Buffer): string => {
+    if (buf.length === 0) return ''
+    try {
+      return new TextDecoder('utf-8', { fatal: true }).decode(buf)
+    } catch {
+      // Not valid UTF-8 — almost always a native tool writing GBK/ANSI.
+    }
+    for (const encoding of ['gbk', 'big5', 'shift_jis', 'windows-1252']) {
+      try {
+        return new TextDecoder(encoding).decode(buf)
+      } catch {
+        // TextDecoder lacks this encoding (Node built without full ICU); try next.
+      }
+    }
+    return buf.toString('utf8')
+  }
+
   /** Execute a shell command and capture both streams. */
   const exec = (
     command: string,
@@ -423,19 +452,28 @@ export function apply(ctx: Context, config: Config = {}): void {
     const limit = Math.min(timeoutMs > 0 ? timeoutMs : 120_000, cap)
     const argv = shell === 'cmd'
       ? ['cmd', '/c', command]
-      : ['powershell', '-NoProfile', '-NonInteractive', '-Command', command]
+      : ['powershell', '-NoProfile', '-NonInteractive', '-Command', `$ErrorActionPreference='Continue';${command}`]
     const startedAt = Date.now()
     execFile(
       argv[0] as string,
       argv.slice(1),
-      { timeout: limit, cwd: text(cwd) ?? undefined, windowsHide: true, maxBuffer: 64 * 1024 * 1024 },
-      (error, stdout, stderr) => {
+      {
+        timeout: limit,
+        cwd: text(cwd) ?? undefined,
+        windowsHide: true,
+        maxBuffer: 64 * 1024 * 1024,
+        // Capture raw bytes: the decoder above needs to see them undamaged.
+        encoding: 'buffer',
+      },
+      (error, stdoutRaw, stderrRaw) => {
+        const stdout = decodeOutput(stdoutRaw as unknown as Buffer)
+        const stderr = decodeOutput(stderrRaw as unknown as Buffer)
         if (error !== null && (error as { killed?: boolean }).killed === true) {
           resolve({
             exit: null,
             timedOut: true,
-            stdout: String(stdout ?? ''),
-            stderr: `${String(stderr ?? '')}\n[dsh-remote] timed out after ${limit} ms`,
+            stdout,
+            stderr: `${stderr}\n[dsh-remote] timed out after ${limit} ms`,
             durationMs: Date.now() - startedAt,
           })
           return
@@ -447,8 +485,8 @@ export function apply(ctx: Context, config: Config = {}): void {
         resolve({
           exit: error === null ? 0 : ((error as { code?: number }).code ?? null),
           timedOut: false,
-          stdout: String(stdout ?? ''),
-          stderr: String(stderr ?? ''),
+          stdout,
+          stderr,
           durationMs: Date.now() - startedAt,
         })
       },
