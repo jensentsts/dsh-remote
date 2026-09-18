@@ -22,8 +22,10 @@ import type { JsonValue } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-settings'
 import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 
-import { clientHandshake, fingerprint } from './protocol.ts'
-import type { Session } from './protocol.ts'
+import { LinkClient } from './link.ts'
+import { PeerProfileSchema, PeerRegistry } from './peers.ts'
+import type { PeerProfile } from './peers.ts'
+import { fingerprint } from './protocol.ts'
 import {
   describeIdentity,
   dshHomePath,
@@ -67,6 +69,17 @@ export interface Config {
   toolEnabled?: boolean
   /** Default session id prefix used by `remote_agent_prompt` when none is given. */
   sessionPrefix?: string
+  /**
+   * The single peer's name, used when only `host`/`port` are configured.
+   * Defaults to `default`. Declaring `peers` instead makes this moot.
+   */
+  peerName?: string
+  /**
+   * Named peers. This is the **one** place a deployment declares a peer: the
+   * registry below is published as a service, so the peer filesystem provider
+   * mounts the same declarations instead of repeating the addresses.
+   */
+  peers?: Record<string, PeerProfile>
 }
 
 export const Config: z<Config> = z.object({
@@ -82,120 +95,10 @@ export const Config: z<Config> = z.object({
   timeoutMs: z.number().default(120_000),
   toolEnabled: z.boolean().default(true),
   sessionPrefix: z.string().default('remote'),
+  peerName: z.string().default('default'),
+  peers: z.dict(PeerProfileSchema).default({}),
 })
 
-/**
- * A reusable authenticated link to the peer.
- *
- * A dropped connection is not an error the caller should see: `request()`
- * reconnects once and replays, because a tunnel that idles out is normal.
- */
-class LinkClient {
-  private session: Session | undefined
-  private pending: Promise<Session> | undefined
-  private counter = 0
-
-  constructor(
-    private readonly read: () => Config,
-    private readonly log: (message: string) => void,
-  ) {}
-
-  /** Open a fresh authenticated session. */
-  private async dial(): Promise<Session> {
-    const { connect } = await import('node:net')
-    const config = this.read()
-    const host = text(config.host)
-    const port = config.port ?? 0
-    const timeout = config.timeoutMs ?? 120_000
-    if (host === undefined || port <= 0) {
-      throw new Error(
-        'dsh-remote-client: set `host` and `port` to the peer\'s reachable endpoint. '
-        + 'Open this plugin\'s settings (dsh-remote-client) and fill them in — for example '
-        + 'the host:port your frp tunnel hands out.',
-      )
-    }
-
-    const socket = connect({ host, port })
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        socket.destroy()
-        reject(new Error(`dsh-remote-client: connect to ${host}:${port} timed out after ${timeout} ms`))
-      }, timeout)
-      socket.once('connect', () => { clearTimeout(timer); resolve() })
-      socket.once('error', (error: Error) => { clearTimeout(timer); reject(error) })
-    })
-    socket.setNoDelay(true)
-    socket.setTimeout(0)
-
-    const session = await clientHandshake(
-      socket,
-      resolvePrivateKey(config, 'client.key').key,
-      resolvePeerPublicKey(config, 'server.pub'),
-    )
-    this.log(`dsh-remote-client: authenticated with ${host}:${port}`)
-    return session
-  }
-
-  private async ensure(): Promise<Session> {
-    if (this.session !== undefined) return this.session
-    if (this.pending === undefined) {
-      this.pending = this.dial()
-        .then((session) => { this.session = session; return session })
-        .finally(() => { this.pending = undefined })
-    }
-    return this.pending
-  }
-
-  /** Drop the current session so the next request redials. */
-  private drop(): void {
-    this.session?.close()
-    this.session = undefined
-  }
-
-  /**
-   * Send one request and return its result, reconnecting once on transport
-   * failure.
-   * @param op - the server-side operation name.
-   * @param args - its arguments.
-   * @param timeoutMs - override for the peer-side operation timeout.
-   * @returns the peer's result object.
-   */
-  async request(
-    op: string,
-    args: Record<string, unknown> = {},
-    timeoutMs?: number,
-  ): Promise<Record<string, unknown>> {
-    const timeout = timeoutMs ?? this.read().timeoutMs ?? 120_000
-    let lastError: unknown
-    for (let attempt = 1; attempt <= 2; attempt += 1) {
-      try {
-        const session = await this.ensure()
-        this.counter += 1
-        await session.send({ id: this.counter, op, ...args })
-        const reply = await session.recv(timeout)
-        if (reply === null) throw new Error('peer closed the link')
-        if (reply.ok !== true) throw new Error(String(reply.error ?? 'peer reported failure'))
-        return reply
-      } catch (error) {
-        lastError = error
-        this.drop()
-        if (attempt === 2) break
-        this.log(`dsh-remote-client: ${op} failed (${error instanceof Error ? error.message : String(error)}); reconnecting`)
-      }
-    }
-    throw lastError instanceof Error ? lastError : new Error(String(lastError))
-  }
-
-  /** True while a session is believed live. */
-  get connected(): boolean {
-    return this.session !== undefined
-  }
-
-  /** Close the session and let it die. */
-  close(): void {
-    this.drop()
-  }
-}
 
 /** Render a result the way the model should read it. */
 function renderText(text: string): Array<{ type: 'text', text: string }> {
@@ -234,7 +137,29 @@ export function apply(ctx: Context, config: Config = {}): void {
     )
   }
 
-  const link = new LinkClient(read, log)
+  const link = new LinkClient(read, log, 'dsh-remote-client')
+
+  // Publish the declarations once. The peer filesystem provider mounts whatever
+  // this registry holds, so a peer's address is written in exactly one place.
+  const peers: Record<string, PeerProfile> = { ...(config.peers ?? {}) }
+  const legacyName = text(config.peerName) ?? 'default'
+  if (peers[legacyName] === undefined && (text(config.host) !== undefined || (config.port ?? 0) > 0)) {
+    peers[legacyName] = {
+      host: config.host,
+      port: config.port,
+      privateKey: config.privateKey,
+      privateKeyFile: config.privateKeyFile,
+      autoGenerateKey: config.autoGenerateKey,
+      peerPublicKey: config.peerPublicKey,
+      peerPublicKeyFile: config.peerPublicKeyFile,
+      timeoutMs: config.timeoutMs,
+      // The top-level endpoint is the configuration that already worked, so it
+      // keeps its old reach rather than being silently downgraded. Declare
+      // `peers` to give a peer a real ceiling.
+      maxPermission: 3,
+    }
+  }
+  ctx.plugin(PeerRegistry, { peers })
 
   const tools = [
     defineTool({
