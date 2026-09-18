@@ -42,6 +42,8 @@ import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-agent-presets'
 
 import { HandshakeError, HANDSHAKE_TIMEOUT_MS, fingerprint, publicToPem, serverHandshake } from './protocol.ts'
+import { FsError } from '@deepseek-ai/dsh-fs'
+import { assertPeerOperation } from './peers.ts'
 import type { Session } from './protocol.ts'
 import {
   describeIdentity,
@@ -67,7 +69,7 @@ export const SERVER_VERSION = '0.1.0'
  * file the runtime may still be serving the previous build. Shipping the tag
  * in `sysinfo` turns "did my edit take effect?" into one tool call.
  */
-export const BUILD = 'r8'
+export const BUILD = 'r9'
 
 /**
  * Hard dependencies. `agentDefaultModel` matters as much as the registries: a
@@ -110,6 +112,14 @@ export interface Config {
   lockoutSeconds?: number
   /** Cap on a single `exec` timeout in milliseconds (default 600000). */
   maxExecTimeoutMs?: number
+  /**
+   * Ceiling on what this machine will accept from a controller, `1 < 2 < 3`:
+   * 1 read-only, 2 confined write, 3 unrestricted. Checked here as well as on
+   * the controlling side, so the limit holds even if the controller is buggy,
+   * compromised, or simply newer. Defaults to 3 (current behaviour); a real
+   * deployment should lower it.
+   */
+  maxPermission?: number
   /** Audit log path (default `${DSH_HOME}/dsh-remote/server-audit.log`). */
   auditFile?: string
   /** Log every accepted operation (default true). */
@@ -130,6 +140,8 @@ export const Config: z<Config> = z.object({
   maxHandshakeFailures: z.number().default(8),
   lockoutSeconds: z.number().default(900),
   maxExecTimeoutMs: z.number().default(600_000),
+  // 3 preserves today's behaviour; lower it to actually fence this machine.
+  maxPermission: z.number().default(3),
   auditFile: z.string().default(dshHomePath('dsh-remote', 'server-audit.log')),
   audit: z.boolean().default(true),
 })
@@ -493,6 +505,21 @@ export function apply(ctx: Context, config: Config = {}): void {
     )
   })
 
+  /**
+   * The version token a guarded write round-trips.
+   *
+   * mtime+size is cheap and good enough to catch "the file changed since you
+   * read it", which is the whole job of the guard. It is explicitly NOT a
+   * content hash: a same-millisecond, same-size edit would slip past, and that
+   * is a deliberate cost trade rather than an oversight.
+   * @param path - the file to describe.
+   * @returns the token.
+   */
+  const fsVersionOf = async (path: string): Promise<string> => {
+    const info = await stat(path)
+    return `${info.mtimeMs}:${info.size}`
+  }
+
   const ops: Record<string, (args: Record<string, unknown>) => Promise<Record<string, unknown>>> = {
     ping: async () => ({ pong: true, version: SERVER_VERSION, pid: process.pid }),
 
@@ -535,15 +562,71 @@ export function apply(ctx: Context, config: Config = {}): void {
       const path = String(args.path ?? '')
       const data = Buffer.from(String(args.dataB64 ?? ''), 'base64')
       const offset = Number(args.offset ?? 0)
+      const expectedVersion = typeof args.expectedVersion === 'string' ? args.expectedVersion : undefined
+      const createOnly = args.createOnly === true
+      const before = await readFile(path).catch(() => undefined)
+
+      // The guard runs BEFORE the write, so a stale write is refused rather than
+      // silently clobbering whatever the other side changed.
+      if (createOnly && before !== undefined) {
+        throw new FsError(`cannot overwrite existing "${path}" without reading it first`, 'FS_NOT_OBSERVED')
+      }
+      if (expectedVersion !== undefined) {
+        if (before === undefined) {
+          throw new FsError(`cannot write "${path}": file no longer exists`, 'FS_STALE_VERSION')
+        }
+        if ((await fsVersionOf(path)) !== expectedVersion) {
+          throw new FsError(`cannot write "${path}": file changed since it was read`, 'FS_STALE_VERSION')
+        }
+      }
+
       mkdirSync(dirname(path), { recursive: true })
       if (offset > 0) {
-        const existing = await readFile(path).catch(() => Buffer.alloc(0))
+        const existing = before ?? Buffer.alloc(0)
         const merged = Buffer.concat([existing.subarray(0, offset), data])
         await writeFile(path, merged)
       } else {
         await writeFile(path, data)
       }
-      return { written: data.length, size: (await stat(path)).size }
+      return {
+        written: data.length,
+        size: (await stat(path)).size,
+        version: await fsVersionOf(path),
+        created: before === undefined,
+        before: before === undefined || offset > 0 ? null : decodeOutput(before),
+      }
+    },
+
+    'fs.edit': async args => {
+      const path = String(args.path ?? '')
+      const oldString = String(args.oldString ?? '')
+      const newString = String(args.newString ?? '')
+      const replaceAll = args.replaceAll === true
+      const expectedVersion = typeof args.expectedVersion === 'string' ? args.expectedVersion : undefined
+      if (oldString === '') throw new FsError('oldString must not be empty', 'FS_EDIT_NOT_FOUND')
+
+      const before = await readFile(path).catch(() => undefined)
+      // Same ordering as the local backend: a stale guard is reported before
+      // match failures, so an edit based on an old read says FS_STALE_VERSION
+      // rather than blaming the text.
+      if (before === undefined) {
+        throw new FsError(`cannot edit "${path}": file changed since it was read`, 'FS_STALE_VERSION')
+      }
+      if (expectedVersion !== undefined && (await fsVersionOf(path)) !== expectedVersion) {
+        throw new FsError(`cannot edit "${path}": file changed since it was read`, 'FS_STALE_VERSION')
+      }
+
+      const text = decodeOutput(before)
+      const count = text.split(oldString).length - 1
+      if (count === 0) {
+        throw new FsError(`cannot edit "${path}": the text to replace was not found`, 'FS_EDIT_NOT_FOUND')
+      }
+      if (count > 1 && !replaceAll) {
+        throw new FsError(`cannot edit "${path}": the text to replace appears ${count} times`, 'FS_AMBIGUOUS_EDIT')
+      }
+      const after = replaceAll ? text.split(oldString).join(newString) : text.replace(oldString, newString)
+      await writeFile(path, Buffer.from(after, 'utf8'))
+      return { version: await fsVersionOf(path), before: text, after }
     },
 
     'fs.list': async args => {
@@ -566,7 +649,13 @@ export function apply(ctx: Context, config: Config = {}): void {
       const path = String(args.path ?? '')
       try {
         const info = await stat(path)
-        return { exists: true, isDir: info.isDirectory(), size: info.size, mtimeMs: info.mtimeMs }
+        return {
+          exists: true,
+          isDir: info.isDirectory(),
+          size: info.size,
+          mtimeMs: info.mtimeMs,
+          version: `${info.mtimeMs}:${info.size}`,
+        }
       } catch {
         return { exists: false }
       }
@@ -687,12 +776,23 @@ export function apply(ctx: Context, config: Config = {}): void {
         }
         const startedAt = Date.now()
         try {
+          // Enforced here as well as on the controller: the same shared rule, so
+          // the two ends can never disagree about what a level admits.
+          assertPeerOperation(read().maxPermission ?? 3, op, {
+            path: typeof request.path === 'string' ? request.path : undefined,
+          })
           const result = await handler(request as Record<string, unknown>)
           await session.send({ id, ok: true, ...result })
           audit(peer, op, true, { ms: Date.now() - startedAt })
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error)
-          await session.send({ id, ok: false, error: message })
+          const code = (error as { code?: unknown }).code
+          await session.send({
+            id,
+            ok: false,
+            error: message,
+            ...(typeof code === 'string' && /^FS_[A-Z_]+$/.test(code) ? { code } : {}),
+          })
           audit(peer, op, false, { ms: Date.now() - startedAt, error: message.slice(0, 500) })
         }
       }
